@@ -6,18 +6,20 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 import json
 from pydantic import BaseModel
+from DB import DatabaseOperations, setup_database
 from dotenv import load_dotenv
 import os 
 load_dotenv()
 
-# Define the State class
 class ChatState(TypedDict):
     """State for the chat conversation."""
     input: str
     conversation_history: List[Dict[str, str]]
-    candidate_info: Optional[Dict]
+    candidate_info: Dict
     current_step: str
+    form_field: Optional[str]
     response: Optional[str]
+    is_form_start: bool  # New flag to track if we're starting the form
 
 def initialize_state(input_text: str) -> ChatState:
     """Initialize the chat state."""
@@ -26,105 +28,32 @@ def initialize_state(input_text: str) -> ChatState:
         conversation_history=[],
         candidate_info={},
         current_step="start",
-        response=None
+        form_field=None,
+        response=None,
+        is_form_start=False
     )
-
-# Database setup
-def setup_database():
-    conn = sqlite3.connect('recruiting.db')
-    cursor = conn.cursor()
-    
-    # Create candidates table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS candidates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        phone TEXT,
-        experience_years INTEGER,
-        skills TEXT,
-        current_role TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Create jobs table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS jobs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        description TEXT,
-        requirements TEXT,
-        location TEXT,
-        salary_range TEXT,
-        is_active BOOLEAN DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-# Database operations
-class DatabaseOperations:
-    def __init__(self, db_path='recruiting.db'):
-        self.db_path = db_path
-    
-    def add_candidate(self, candidate_data: Dict) -> bool:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        try:
-            cursor.execute('''
-            INSERT INTO candidates (name, email, phone, experience_years, skills, current_role)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                candidate_data['name'],
-                candidate_data['email'],
-                candidate_data['phone'],
-                candidate_data['experience_years'],
-                candidate_data['skills'],
-                candidate_data['current_role']
-            ))
-            conn.commit()
-            return True
-        except Exception as e:
-            print(f"Error adding candidate: {e}")
-            return False
-        finally:
-            conn.close()
-    
-    def get_active_jobs(self) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM jobs WHERE is_active = 1')
-        jobs = cursor.fetchall()
-        conn.close()
-        
-        return [{
-            'id': job[0],
-            'title': job[1],
-            'description': job[2],
-            'requirements': job[3],
-            'location': job[4],
-            'salary_range': job[5]
-        } for job in jobs]
 
 # Chatbot Agent
 class RecruitingAgent:
     def __init__(self, openai_api_key: str):
         self.llm = ChatOpenAI(api_key=openai_api_key)
         self.db = DatabaseOperations()
-        
+        self.form_fields = [
+            ("name", "Could you please tell me your full name?"),
+            ("email", "What's your email address?"),
+            ("phone", "What's your phone number?"),
+            ("experience_years", "How many years of experience do you have?"),
+            ("current_role", "What is your current role?"),
+            ("skills", "What are your key skills and technologies you're proficient in?")
+        ]
+    
     def create_graph(self):
-        # Define the states and workflow
         workflow = StateGraph(ChatState)
         
-        # Define the nodes
         workflow.add_node("start", self._determine_intent)
         workflow.add_node("handle_job_form", self._handle_job_form)
         workflow.add_node("handle_job_inquiry", self._handle_job_inquiry)
         
-        # Add edges
         workflow.add_conditional_edges(
             "start",
             self._route_intent,
@@ -134,14 +63,18 @@ class RecruitingAgent:
             }
         )
         
-        # Add end edges
-        workflow.add_edge("handle_job_form", END)
+        workflow.add_edge("handle_job_form", "handle_job_form")
         workflow.add_edge("handle_job_inquiry", END)
         
         workflow.set_entry_point("start")
         return workflow.compile()
     
     def _determine_intent(self, state: ChatState) -> ChatState:
+        # If we're already in form filling mode, continue with it
+        if state.get('form_field') and not state.get('is_form_start', False):
+            state['current_step'] = "job_form"
+            return state
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a recruiting assistant. Determine if the user wants to:
             1. Apply for a job (fill out a job application form)
@@ -153,50 +86,104 @@ class RecruitingAgent:
         response = self.llm.invoke(prompt.format(input=state['input']))
         intent = response.content.strip().lower()
         
+        if intent == "job_form":
+            state['is_form_start'] = True
+            state['form_field'] = None
+        
         state['current_step'] = intent
         return state
-    
+
+    def _handle_job_form(self, state: ChatState) -> ChatState:
+        print("\nDebug - Current state:", {
+            'form_field': state.get('form_field'),
+            'is_form_start': state.get('is_form_start'),
+            'input': state.get('input'),
+            'candidate_info': state.get('candidate_info')
+        })
+
+        # Start the form if it's the beginning
+        if state.get('is_form_start', False):
+            state['is_form_start'] = False
+            state['form_field'] = 'name'
+            state['response'] = "I'll help you apply for a job. Could you please tell me your full name?"
+            return state
+
+        # Current form field
+        form_field = state.get('form_field')
+        candidate_info = state.get('candidate_info', {})
+
+        if not form_field:
+            # If no field is set, restart the process
+            state['form_field'] = 'name'
+            state['response'] = "Let's start the application process. Could you please tell me your full name?"
+            return state
+
+        # Process the user's input for the current field
+        try:
+            # Validate input only for the current field
+            if state['input']:
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", f"""You are a recruiting assistant collecting the {form_field}.
+                    Extract only the {form_field} from the user's message.
+                    Respond with only the extracted value, nothing else."""),
+                    ("user", "{input}")
+                ])
+                response = self.llm.invoke(prompt.format(input=state['input']))
+                extracted_value = response.content.strip()
+
+                if not extracted_value or extracted_value.lower() in ["n/a", "i don't know", ""]:
+                    raise ValueError(f"Invalid input for {form_field}")
+
+                # Store the extracted information
+                candidate_info[form_field] = extracted_value
+                state['candidate_info'] = candidate_info
+
+                # Clear input for the next question
+                state['input'] = None
+
+                # Move to the next field
+                current_field_index = next(
+                    (i for i, (field, _) in enumerate(self.form_fields) if field == form_field), None
+                )
+                if current_field_index is not None and current_field_index < len(self.form_fields) - 1:
+                    next_field, next_question = self.form_fields[current_field_index + 1]
+                    state['form_field'] = next_field
+                    state['response'] = f"Great! {next_question}"
+                else:
+                    # All fields completed, try saving candidate info
+                    if self._is_candidate_data_complete(candidate_info):
+                        try:
+                            if self.db.add_candidate(candidate_info):
+                                state['response'] = "Thank you for submitting your application! We'll review it and get back to you soon."
+                                state['current_step'] = 'end'
+                                state['form_field'] = None
+                            else:
+                                state['response'] = "There was an error processing your application. Please try again."
+                        except Exception as e:
+                            state['response'] = f"Error adding candidate: {str(e)}. Please try again."
+                            state['form_field'] = 'name'
+                    else:
+                        state['response'] = "Some required information is missing. Let's start again. Could you tell me your full name?"
+                        state['form_field'] = 'name'
+            else:
+                # Ask again if no input provided
+                state['response'] = f"I still need your {form_field}. Could you please provide it?"
+        except Exception as e:
+            print(f"Error processing field {form_field}: {e}")
+            state['response'] = f"I didn't quite get your {form_field}. Could you please provide it again?"
+
+        # Update conversation history
+        state['conversation_history'] = state.get('conversation_history', []) + [
+            {"role": "human", "content": state['input'] or "<No input provided>"},
+            {"role": "assistant", "content": state['response']}
+        ]
+
+        return state
+
     def _route_intent(self, state: ChatState) -> str:
         return state['current_step']
-    
-    def _handle_job_form(self, state: ChatState) -> ChatState:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a recruiting assistant collecting job application information.
-            Extract the following information in JSON format:
-            {
-                "name": "",
-                "email": "",
-                "phone": "",
-                "experience_years": 0,
-                "skills": "",
-                "current_role": ""
-            }
-            If any information is missing, ask for it politely."""),
-            ("user", "{input}")
-        ])
-        
-        # Add conversation history to help with context
-        history = state['conversation_history']
-        full_input = "\n".join([msg['content'] for msg in history] + [state['input']])
-        
-        response = self.llm.invoke(prompt.format(input=full_input))
-        try:
-            candidate_data = json.loads(response.content)
-            if self._is_candidate_data_complete(candidate_data):
-                if self.db.add_candidate(candidate_data):
-                    state['response'] = "Thank you for submitting your application! We'll review it and get back to you soon."
-                else:
-                    state['response'] = "There was an error processing your application. Please try again."
-            else:
-                missing_fields = self._get_missing_fields(candidate_data)
-                state['response'] = f"Could you please provide your {', '.join(missing_fields)}?"
-                state['candidate_info'].update(candidate_data)
-        except json.JSONDecodeError:
-            state['response'] = "I couldn't process your information. Could you please provide your details again?"
-        
-        state['conversation_history'].append({"role": "assistant", "content": state['response']})
-        return state
-    
+
+
     def _handle_job_inquiry(self, state: ChatState) -> ChatState:
         jobs = self.db.get_active_jobs()
         
@@ -236,6 +223,9 @@ def main():
     print("2. Ask about available jobs by saying something like 'What jobs are available?'")
     print("\n")
     
+    # Initialize conversation state
+    current_state = initialize_state("")
+    
     while True:
         # Get user input
         user_input = input("You: ").strip()
@@ -246,14 +236,22 @@ def main():
             break
             
         try:
-            # Initialize state for this turn of conversation
-            current_state = initialize_state(user_input)
+            # Update input in current state
+            current_state['input'] = user_input
             
             # Get the agent's response
             result = workflow.invoke(current_state)
             
+            # Update current state with result
+            current_state.update(result)
+            
             # Print the response
             print(f"\nBot: {result['response']}\n")
+            
+            # Check if we've finished the form
+            if result.get('current_step') == 'end':
+                # Reset the state for the next interaction
+                current_state = initialize_state("")
             
         except Exception as e:
             print(f"\nBot: I apologize, but I encountered an error: {str(e)}")
