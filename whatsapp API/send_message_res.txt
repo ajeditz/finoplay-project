@@ -1,0 +1,1 @@
+{'result': 'success', 'message': 'Message processed', 'data': {'log_uid': 'ee465c56-cfe1-4618-a4fc-72272f8b7d9e', 'contact_uid': '2850f241-315a-4dff-88d8-c7d2f8c4bd77', 'phone_number': '9424553935', 'wamid': 'wamid.HBgMOTE5NDI0NTUzOTM1FQIAERgSNjk4RDk5ODczMEExNEUxRDhEAA==', 'status': 'accepted'}}
